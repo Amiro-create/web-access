@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // 环境检查 + 确保 CDP Proxy 就绪（跨平台，替代 check-deps.sh）
 
-import { spawn } from 'node:child_process';
+import { spawn, execSync } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -138,15 +138,109 @@ async function ensureProxy() {
   return false;
 }
 
+// --- Chrome 路径（跨平台） ---
+
+function chromeExePaths() {
+  const home = os.homedir();
+  switch (os.platform()) {
+    case 'darwin':
+      return [
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        '/Applications/Chromium.app/Contents/MacOS/Chromium',
+      ];
+    case 'linux':
+      return ['google-chrome', 'chromium', 'chromium-browser'];
+    case 'win32': {
+      const progFiles = process.env['ProgramFiles'] || 'C:\\Program Files';
+      const progFiles86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+      const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
+      return [
+        path.join(progFiles, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        path.join(progFiles86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        path.join(localAppData, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      ];
+    }
+    default:
+      return [];
+  }
+}
+
+// --- Chrome 是否已在运行（进程检测） ---
+
+function isChromeProcessRunning() {
+  try {
+    switch (os.platform()) {
+      case 'darwin':
+        return execSync('pgrep -x "Google Chrome" 2>/dev/null || pgrep -x Chromium 2>/dev/null', { encoding: 'utf8' }).trim().length > 0;
+      case 'linux':
+        return execSync('pgrep -x "chrome" 2>/dev/null || pgrep -x "chromium" 2>/dev/null', { encoding: 'utf8' }).trim().length > 0;
+      case 'win32': {
+        const out = execSync('tasklist /FI "IMAGENAME eq chrome.exe" 2>NUL', { encoding: 'utf8', windowsHide: true });
+        return out.includes('chrome.exe');
+      }
+      default:
+        return false;
+    }
+  } catch {
+    return false;
+  }
+}
+
+// --- 自动启动 Chrome ---
+
+function launchChrome(port = 9222) {
+  for (const exe of chromeExePaths()) {
+    if (fs.existsSync(exe)) {
+      console.log(`chrome: launching... (${exe})`);
+      const child = spawn(exe, [
+        `--remote-debugging-port=${port}`,
+        '--no-first-run',
+        '--no-default-browser-check',
+      ], {
+        detached: true,
+        stdio: 'ignore',
+        ...(os.platform() === 'win32' ? { windowsHide: true } : {}),
+      });
+      child.unref();
+      return true;
+    }
+  }
+  return false;
+}
+
 // --- main ---
 
 async function main() {
   checkNode();
 
-  const chromePort = await detectChromePort();
+  let chromePort = await detectChromePort();
   if (!chromePort) {
-    console.log('chrome: not connected — 请确保 Chrome 已打开，然后访问 chrome://inspect/#remote-debugging 并勾选 Allow remote debugging');
-    process.exit(1);
+    const running = isChromeProcessRunning();
+    if (running) {
+      // Chrome 已运行但无调试端口 — 无法注入，需手动重启
+      console.log('chrome: 已运行但未开启远程调试 — 请完全关闭 Chrome 后重试（我将自动拉起带调试端口的 Chrome）');
+      process.exit(1);
+    }
+
+    // Chrome 未运行，尝试自动启动
+    const launched = launchChrome();
+    if (!launched) {
+      console.log('chrome: not connected — 未找到 Chrome 安装路径，请手动打开 Chrome 后访问 chrome://inspect/#remote-debugging 并勾选 Allow remote debugging');
+      process.exit(1);
+    }
+
+    // 等待 Chrome 启动并就绪
+    for (let i = 1; i <= 20; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      chromePort = await detectChromePort();
+      if (chromePort) break;
+      if (i === 3) console.log('  等待 Chrome 启动...');
+    }
+
+    if (!chromePort) {
+      console.log('chrome: 启动超时 — 请手动打开 Chrome 后重试');
+      process.exit(1);
+    }
   }
   console.log(`chrome: ok (port ${chromePort})`);
 
